@@ -15,7 +15,11 @@ use Symfony\Component\Filesystem\Exception\FileNotFoundException;
 use Symfony\Component\Finder\Finder;
 use Symfony\Component\HttpClient\CurlHttpClient;
 use Symfony\Component\OptionsResolver\OptionsResolver;
+use Symfony\Contracts\HttpClient\Exception\ClientExceptionInterface;
 use Symfony\Contracts\HttpClient\Exception\ExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\RedirectionExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\ServerExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 use ZipArchive;
 
 class GarApiService
@@ -26,10 +30,10 @@ class GarApiService
     private string $sslKey;
     private string $remoteEnv;
     private string $cacheDirectory;
-    private ?string $reportSslCert = null;
-    private ?string $reportSslKey = null;
+    private ?string $reportSslCert;
+    private ?string $reportSslKey;
 
-    private CurlHttpClient $client;
+    private ?CurlHttpClient $client = null;
     private ?CurlHttpClient $reportClient = null;
 
     private const ENDPOINT_PREFIXES = [
@@ -63,40 +67,6 @@ class GarApiService
         $this->cacheDirectory = $cacheDirectory;
         $this->reportSslKey = $reportSslKey;
         $this->reportSslCert = $reportSslCert;
-
-        $this->client = new CurlHttpClient([
-            'local_cert' => $this->sslCert,
-            'local_pk'   => $this->sslKey,
-            'headers'    => [
-                "Content-type: application/xml",
-                "Accept: application/xml",
-            ],
-        ]);
-
-        if (!file_exists($sslCert)) {
-            throw new FileNotFoundException(sprintf("SSL Cert: %s does not exist", $sslCert));
-        }
-        if (!file_exists($sslKey)) {
-            throw new FileNotFoundException(sprintf("SSL Key: %s does not exist", $sslKey));
-        }
-        if (!is_dir($cacheDirectory)) {
-            try {
-                mkdir($cacheDirectory);
-            } catch (Exception $e) {
-                throw new FileNotFoundException("Could not find or create cache directory $cacheDirectory");
-            }
-        }
-
-        if (isset($this->reportSslKey) && isset($this->reportSslCert)) {
-            $this->reportClient = new CurlHttpClient([
-                'local_cert' => $this->reportSslCert,
-                'local_pk'   => $this->reportSslKey,
-                'headers'    => [
-                    "Content-type: application/xml",
-                    "Accept: application/json",
-                ],
-            ]);
-        }
     }
 
     public function isProd(): bool
@@ -129,6 +99,73 @@ class GarApiService
         return $this->cacheDirectory . '/' . date('Y/m/d.') . ($uaiOnly ? 'uai-only.' : '') . $extension;
     }
 
+    private function getClient(): CurlHttpClient
+    {
+        if ($this->client instanceof CurlHttpClient) {
+            return $this->client;
+        }
+
+        if (!file_exists($this->sslCert)) {
+            throw new FileNotFoundException(sprintf("SSL Cert: %s does not exist", $this->sslCert));
+        }
+
+        if (!file_exists($this->sslKey)) {
+            throw new FileNotFoundException(sprintf("SSL Key: %s does not exist", $this->sslKey));
+        }
+
+        if (!is_dir($this->cacheDirectory)) {
+            try {
+                mkdir($this->cacheDirectory, 0777, true);
+            } catch (Exception) {
+                throw new FileNotFoundException("Could not find or create cache directory $this->cacheDirectory");
+            }
+        }
+
+        $this->client = new CurlHttpClient([
+            'local_cert' => $this->sslCert,
+            'local_pk'   => $this->sslKey,
+            'headers'    => [
+                "Content-type: application/xml",
+                "Accept: application/xml",
+            ],
+        ]);
+
+        return $this->client;
+    }
+
+    /**
+     * @throws Exception
+     */
+    private function getReportClient(): CurlHttpClient
+    {
+        if ($this->reportClient instanceof CurlHttpClient) {
+            return $this->reportClient;
+        }
+
+        if (!isset($this->reportSslKey) || !isset($this->reportSslCert)) {
+            throw new Exception("You must configure the report certificate parameters (`report_ssl_*`) to use this feature");
+        }
+
+        if (!file_exists($this->reportSslCert)) {
+            throw new FileNotFoundException(sprintf("Report SSL Cert: %s does not exist", $this->reportSslCert));
+        }
+
+        if (!file_exists($this->reportSslKey)) {
+            throw new FileNotFoundException(sprintf("Report SSL Key: %s does not exist", $this->reportSslKey));
+        }
+
+        $this->reportClient = new CurlHttpClient([
+            'local_cert' => $this->reportSslCert,
+            'local_pk'   => $this->reportSslKey,
+            'headers'    => [
+                "Content-type: application/xml",
+                "Accept: application/json",
+            ],
+        ]);
+
+        return $this->reportClient;
+    }
+
     /**
      * @return array<string, array{
      *     uai: string,
@@ -159,7 +196,7 @@ class GarApiService
         $xmlPath = $this->getInstitutionPath('xml');
         $phpPath = $this->getInstitutionPath('php');
         if (!file_exists($phpPath)) {
-            $response = $this->client->request('GET', $this->getEndpoint('/etablissements/etablissements.xml'));
+            $response = $this->getClient()->request('GET', $this->getEndpoint('/etablissements/etablissements.xml'));
 
             if ($response->getStatusCode() === 200) {
                 $content = $response->getContent();
@@ -193,7 +230,7 @@ class GarApiService
 
         $phpPath = $this->getInstitutionPath('php', true);
         if (!file_exists($phpPath)) {
-            $response = $this->client->request('GET', $this->getEndpoint('/etablissements/etablissements.xml'));
+            $response = $this->getClient()->request('GET', $this->getEndpoint('/etablissements/etablissements.xml'));
 
             if ($response->getStatusCode() === 200) {
                 $content = $response->getContent();
@@ -243,6 +280,12 @@ class GarApiService
         return in_array($uai, $this->getInstitutionUAIs());
     }
 
+    /**
+     * @throws TransportExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ClientExceptionInterface
+     */
     public function getSubscriptions(?GarSubscriptionFilter $filter = null): array
     {
 
@@ -250,7 +293,7 @@ class GarApiService
             $filter = new GarSubscriptionFilter();
         }
 
-        $response = $this->client->request('POST', $this->getEndpoint('/abonnements'), [
+        $response = $this->getClient()->request('POST', $this->getEndpoint('/abonnements'), [
             'body' => $filter->getNodeString(),
         ]);
 
@@ -270,6 +313,9 @@ class GarApiService
         return $subscriptions;
     }
 
+    /**
+     * @throws TransportExceptionInterface
+     */
     public function createSubscription(GarCreatableSubscriptionInterface $subscription, GarResource $resource, GarAssignment $assignment): bool
     {
         $cpr = $subscription->getGarSubscriptionResourceProjectCode();
@@ -278,7 +324,7 @@ class GarApiService
         $input = <<<XML
             <abonnement xmlns="http://www.atosworldline.com/wsabonnement/v1.0/">
                 <idAbonnement>{$subscription->getGarSubscriptionId()}</idAbonnement>
-                <idDistributeurCom>{$this->distributorId}</idDistributeurCom>
+                <idDistributeurCom>$this->distributorId</idDistributeurCom>
                 <idRessource>{$resource->getId()}</idRessource>
                 <typeIdRessource>{$resource->getType()}</typeIdRessource>
                 <libelleRessource>{$resource->getLabel()}</libelleRessource>
@@ -293,7 +339,7 @@ class GarApiService
             </abonnement>
         XML;
 
-        $response = $this->client->request(
+        $response = $this->getClient()->request(
             "PUT",
             $this->getEndpoint("/" . $subscription->getGarSubscriptionId()),
             ['body' => $input]
@@ -302,18 +348,24 @@ class GarApiService
         return $response->getStatusCode() === 201;
     }
 
+    /**
+     * @throws TransportExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ClientExceptionInterface
+     */
     private function getSubscriptionXml(string $subscriptionId): ?SimpleXMLElement
     {
         $filter = <<<FILTER
             <filtres xmlns="http://www.atosworldline.com/wsabonnement/v1.0/">
                 <filtre>
                     <filtreNom>idAbonnement</filtreNom>
-                    <filtreValeur>{$subscriptionId}</filtreValeur>
+                    <filtreValeur>$subscriptionId</filtreValeur>
                 </filtre>
             </filtres>
         FILTER;
 
-        $response = $this->client->request('POST', $this->getEndpoint('/abonnements'), [
+        $response = $this->getClient()->request('POST', $this->getEndpoint('/abonnements'), [
             'body' => $filter
         ]);
 
@@ -330,6 +382,12 @@ class GarApiService
         return null;
     }
 
+    /**
+     * @throws TransportExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ClientExceptionInterface
+     */
     public function updateSubscriptionDates(string $subscriptionId, GarCreatableSubscriptionInterface $subscription): bool
     {
         $xml = $this->getSubscriptionXml($subscriptionId);
@@ -353,16 +411,19 @@ class GarApiService
         // Hackish
         $namespacedXml = str_replace('<abonnement>', '<abonnement xmlns="http://www.atosworldline.com/wsabonnement/v1.0/">', $xml->asXML());
 
-        $response = $this->client->request('POST', $this->getEndpoint("/$subscriptionId"), [
+        $response = $this->getClient()->request('POST', $this->getEndpoint("/$subscriptionId"), [
             'body' => $namespacedXml
         ]);
 
         return $response->getStatusCode() === 200;
     }
 
+    /**
+     * @throws TransportExceptionInterface
+     */
     public function deleteSubscription(string $subscriptionId): bool
     {
-        $response = $this->client->request(
+        $response = $this->getClient()->request(
             "DELETE",
             $this->getEndpoint("/" . $subscriptionId)
         );
@@ -372,6 +433,8 @@ class GarApiService
 
     /**
      * @return GarReport[]
+     * @throws Exception
+     * @throws TransportExceptionInterface
      */
     public function getReports(bool $notAcknowledged = true, bool $acknowledged = false): array {
         if (!$notAcknowledged && !$acknowledged) {
@@ -384,7 +447,7 @@ class GarApiService
             $status = $notAcknowledged ? GarReport::STATUS_NOT_ACKNOWLEDGED : GarReport::STATUS_ACKNOWLEDGED;
         }
 
-        $response = $this->reportClient->request('GET', $this->getReportEndpoint(sprintf("/rapportsAffectation/%s/%s", $this->distributorId, $status)));
+        $response = $this->getReportClient()->request('GET', $this->getReportEndpoint(sprintf("/rapportsAffectation/%s/%s", $this->distributorId, $status)));
         $content = $response->getContent();
         $data = json_decode($content, true);
 
@@ -414,14 +477,12 @@ class GarApiService
     }
 
     /**
+     * @throws TransportExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ClientExceptionInterface
      * @throws Exception
      */
-    private function ensureReportCertificate(): void {
-        if (is_null($this->reportClient)) {
-            throw new Exception("You must configure the report certificate parameters (`report_ssl_*`) to use this feature");
-        }
-    }
-
     private function ensureLatestGlobalReport(): string {
         $todayPath = $this->getTodayGlobalReportPath();
 
@@ -435,10 +496,8 @@ class GarApiService
             unlink($oldFile->getRealPath());
         }
 
-        $this->ensureReportCertificate();
-
         // We don't care about the status filter because the global report is listed in all responses
-        $response = $this->reportClient->request('GET', $this->getReportEndpoint(sprintf("/rapportsAffectation/%s/%s", $this->distributorId, GarReport::STATUS_ACKNOWLEDGED)));
+        $response = $this->getReportClient()->request('GET', $this->getReportEndpoint(sprintf("/rapportsAffectation/%s/%s", $this->distributorId, GarReport::STATUS_ACKNOWLEDGED)));
         $content = $response->getContent();
         $data = json_decode($content, true);
 
@@ -455,11 +514,16 @@ class GarApiService
         return $todayPath;
     }
 
+    /**
+     * @throws TransportExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ClientExceptionInterface
+     * @throws Exception
+     */
     private function downloadReport(string|GarReport $report): string {
-        $this->ensureReportCertificate();
-
         $reportIdentifier = is_string($report) ? $report : $report->getName();
-        $response = $this->reportClient->request('GET', $this->getReportEndpoint(sprintf("/GAR-Affectations/%s/%s", $this->distributorId, $reportIdentifier)));
+        $response = $this->getReportClient()->request('GET', $this->getReportEndpoint(sprintf("/GAR-Affectations/%s/%s", $this->distributorId, $reportIdentifier)));
         $directory = $this->cacheDirectory . '/reports';
 
         if (!is_dir($directory)) {
@@ -497,6 +561,11 @@ class GarApiService
      *      },
      *     uai: string
      * }[]
+     *
+     * @throws ClientExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws TransportExceptionInterface
      */
     public function getGlobalReportItems(array $options = []): array {
         $xml = simplexml_load_file($this->ensureLatestGlobalReport());
