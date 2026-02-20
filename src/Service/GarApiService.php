@@ -3,6 +3,16 @@
 namespace eduMedia\GarApiBundle\Service;
 
 use DateTimeImmutable;
+use eduMedia\GarApiBundle\Service\Exception\GarCertificateConfigurationException;
+use eduMedia\GarApiBundle\Service\Exception\GarGlobalReportDownloadException;
+use eduMedia\GarApiBundle\Service\Exception\GarInstitutionListLoadException;
+use eduMedia\GarApiBundle\Service\Exception\GarReportDownloadException;
+use eduMedia\GarApiBundle\Service\Exception\GarReportListGetException;
+use eduMedia\GarApiBundle\Service\Exception\GarSubscriptionCreateException;
+use eduMedia\GarApiBundle\Service\Exception\GarSubscriptionDatesUpdateException;
+use eduMedia\GarApiBundle\Service\Exception\GarSubscriptionDeleteException;
+use eduMedia\GarApiBundle\Service\Exception\GarSubscriptionListLoadException;
+use eduMedia\GarApiBundle\Service\Exception\GarSubscriptionXmlGetException;
 use eduMedia\GarApiBundle\Service\vo\GarAssignment;
 use eduMedia\GarApiBundle\Service\vo\GarCreatableSubscriptionInterface;
 use eduMedia\GarApiBundle\Service\vo\GarReport;
@@ -16,7 +26,6 @@ use Symfony\Component\Finder\Finder;
 use Symfony\Component\HttpClient\CurlHttpClient;
 use Symfony\Component\OptionsResolver\OptionsResolver;
 use Symfony\Contracts\HttpClient\Exception\ClientExceptionInterface;
-use Symfony\Contracts\HttpClient\Exception\ExceptionInterface;
 use Symfony\Contracts\HttpClient\Exception\RedirectionExceptionInterface;
 use Symfony\Contracts\HttpClient\Exception\ServerExceptionInterface;
 use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
@@ -24,7 +33,6 @@ use ZipArchive;
 
 class GarApiService
 {
-
     private string $distributorId;
     private string $sslCert;
     private string $sslKey;
@@ -51,11 +59,11 @@ class GarApiService
     private ?array $cachedInstitutionUAIs = null;
 
     public function __construct(
-        string $distributorId,
-        string $sslCert,
-        string $sslKey,
-        string $remoteEnv,
-        string $cacheDirectory,
+        string  $distributorId,
+        string  $sslCert,
+        string  $sslKey,
+        string  $remoteEnv,
+        string  $cacheDirectory,
         ?string $reportSslCert = null,
         ?string $reportSslKey = null
     )
@@ -134,7 +142,7 @@ class GarApiService
     }
 
     /**
-     * @throws Exception
+     * @throws GarCertificateConfigurationException
      */
     private function getReportClient(): CurlHttpClient
     {
@@ -143,15 +151,15 @@ class GarApiService
         }
 
         if (!isset($this->reportSslKey) || !isset($this->reportSslCert)) {
-            throw new Exception("You must configure the report certificate parameters (`report_ssl_*`) to use this feature");
+            throw new GarCertificateConfigurationException("You must configure the report certificate parameters (`report_ssl_*`) to use this feature");
         }
 
         if (!file_exists($this->reportSslCert)) {
-            throw new FileNotFoundException(sprintf("Report SSL Cert: %s does not exist", $this->reportSslCert));
+            throw new GarCertificateConfigurationException(sprintf("Report SSL Cert: %s does not exist", $this->reportSslCert));
         }
 
         if (!file_exists($this->reportSslKey)) {
-            throw new FileNotFoundException(sprintf("Report SSL Key: %s does not exist", $this->reportSslKey));
+            throw new GarCertificateConfigurationException(sprintf("Report SSL Key: %s does not exist", $this->reportSslKey));
         }
 
         $this->reportClient = new CurlHttpClient([
@@ -164,6 +172,23 @@ class GarApiService
         ]);
 
         return $this->reportClient;
+    }
+
+    /**
+     * @return string
+     * @throws GarInstitutionListLoadException
+     */
+    private function getInstitutionListContents(): string
+    {
+        $response = $this->getClient()->request('GET', $this->getEndpoint('/etablissements/etablissements.xml'));
+
+        try {
+            $content = $response->getContent();
+        } catch (ClientExceptionInterface|RedirectionExceptionInterface|ServerExceptionInterface|TransportExceptionInterface $e) {
+            throw new GarInstitutionListLoadException('Could not get institution list contents', previous: $e);
+        }
+
+        return $content;
     }
 
     /**
@@ -185,7 +210,8 @@ class GarApiService
      *     localite_acheminement_uai: string,
      *     idENT: string,
      * }>
-     * @throws ExceptionInterface
+     *
+     * @throws GarInstitutionListLoadException
      */
     public function getInstitutions(): array
     {
@@ -193,66 +219,65 @@ class GarApiService
             return $this->cachedInstitutions;
         }
 
-        $xmlPath = $this->getInstitutionPath('xml');
         $phpPath = $this->getInstitutionPath('php');
-        if (!file_exists($phpPath)) {
-            $response = $this->getClient()->request('GET', $this->getEndpoint('/etablissements/etablissements.xml'));
 
-            if ($response->getStatusCode() === 200) {
-                $content = $response->getContent();
-
-                if (!is_dir(dirname($xmlPath))) {
-                    mkdir(dirname($xmlPath), 0777, true);
-                }
-
-                $this->cachedInstitutions = $this->xmlToInstitutionArray($content);
-
-                file_put_contents($xmlPath, $content);
-                file_put_contents($phpPath, "<?php\nreturn " . var_export($this->cachedInstitutions, true) . ";");
-            } else {
-                $this->cachedInstitutions = [];
-            }
-        } else {
+        if (file_exists($phpPath)) {
             $this->cachedInstitutions = include $phpPath;
+
+            return $this->cachedInstitutions;
         }
+
+        $xmlPath = $this->getInstitutionPath('xml');
+        $content = $this->getInstitutionListContents();
+
+        $this->cachedInstitutions = $this->xmlToInstitutionArray($content);
+
+        if (!is_dir(dirname($xmlPath))) {
+            mkdir(dirname($xmlPath), 0777, true);
+        }
+
+        if (!is_dir(dirname($phpPath))) {
+            mkdir(dirname($phpPath), 0777, true);
+        }
+
+        file_put_contents($xmlPath, $content);
+        file_put_contents($phpPath, "<?php\nreturn " . var_export($this->cachedInstitutions, true) . ";");
 
         return $this->cachedInstitutions;
     }
 
     /**
      * @return string[]
-     * @throws ExceptionInterface
+     * @throws GarInstitutionListLoadException
      */
-    public function getInstitutionUAIs(): array {
+    public function getInstitutionUAIs(): array
+    {
         if (isset($this->cachedInstitutionUAIs)) {
             return $this->cachedInstitutionUAIs;
         }
 
         $phpPath = $this->getInstitutionPath('php', true);
-        if (!file_exists($phpPath)) {
-            $response = $this->getClient()->request('GET', $this->getEndpoint('/etablissements/etablissements.xml'));
 
-            if ($response->getStatusCode() === 200) {
-                $content = $response->getContent();
-
-                if (!is_dir(dirname($phpPath))) {
-                    mkdir(dirname($phpPath), 0777, true);
-                }
-
-                $this->cachedInstitutionUAIs = array_keys($this->xmlToInstitutionArray($content));
-
-                file_put_contents($phpPath, "<?php\nreturn " . var_export($this->cachedInstitutionUAIs, true) . ";");
-            } else {
-                $this->cachedInstitutionUAIs = [];
-            }
-        } else {
+        if (file_exists($phpPath)) {
             $this->cachedInstitutionUAIs = include $phpPath;
+
+            return $this->cachedInstitutionUAIs;
         }
+
+        $content = $this->getInstitutionListContents();
+        $this->cachedInstitutionUAIs = array_keys($this->xmlToInstitutionArray($content));
+
+        if (!is_dir(dirname($phpPath))) {
+            mkdir(dirname($phpPath), 0777, true);
+        }
+
+        file_put_contents($phpPath, "<?php\nreturn " . var_export($this->cachedInstitutionUAIs, true) . ";");
 
         return $this->cachedInstitutionUAIs;
     }
 
-    private function xmlToInstitutionArray(string $xml): array {
+    private function xmlToInstitutionArray(string $xml): array
+    {
         $xml = simplexml_load_string(
             $xml,
             "SimpleXMLElement",
@@ -273,7 +298,7 @@ class GarApiService
     }
 
     /**
-     * @throws ExceptionInterface
+     * @throws GarInstitutionListLoadException
      */
     public function hasInstitution(string $uai): bool
     {
@@ -281,14 +306,10 @@ class GarApiService
     }
 
     /**
-     * @throws TransportExceptionInterface
-     * @throws ServerExceptionInterface
-     * @throws RedirectionExceptionInterface
-     * @throws ClientExceptionInterface
+     * @throws GarSubscriptionListLoadException
      */
     public function getSubscriptions(?GarSubscriptionFilter $filter = null): array
     {
-
         if (is_null($filter)) {
             $filter = new GarSubscriptionFilter();
         }
@@ -297,7 +318,13 @@ class GarApiService
             'body' => $filter->getNodeString(),
         ]);
 
-        $xml = simplexml_load_string($response->getContent());
+        try {
+            $content = $response->getContent();
+        } catch (ClientExceptionInterface|RedirectionExceptionInterface|ServerExceptionInterface|TransportExceptionInterface $e) {
+            throw new GarSubscriptionListLoadException('Could not get subscription list contents', previous: $e);
+        }
+
+        $xml = simplexml_load_string($content);
         $subscriptions = array();
 
         foreach ($xml->children() as $subscriptionNode) {
@@ -314,7 +341,7 @@ class GarApiService
     }
 
     /**
-     * @throws TransportExceptionInterface
+     * @throws GarSubscriptionCreateException
      */
     public function createSubscription(GarCreatableSubscriptionInterface $subscription, GarResource $resource, GarAssignment $assignment): bool
     {
@@ -345,14 +372,17 @@ class GarApiService
             ['body' => $input]
         );
 
-        return $response->getStatusCode() === 201;
+        try {
+            $statusCode = $response->getStatusCode();
+        } catch (TransportExceptionInterface $e) {
+            throw new GarSubscriptionCreateException('Could not create subscription', previous: $e);
+        }
+
+        return $statusCode === 201;
     }
 
     /**
-     * @throws TransportExceptionInterface
-     * @throws ServerExceptionInterface
-     * @throws RedirectionExceptionInterface
-     * @throws ClientExceptionInterface
+     * @throws GarSubscriptionXmlGetException
      */
     private function getSubscriptionXml(string $subscriptionId): ?SimpleXMLElement
     {
@@ -369,11 +399,11 @@ class GarApiService
             'body' => $filter
         ]);
 
-        if ($response->getStatusCode() !== 200) {
-            return null;
+        try {
+            $xml = simplexml_load_string($response->getContent());
+        } catch (ClientExceptionInterface|RedirectionExceptionInterface|ServerExceptionInterface|TransportExceptionInterface $e) {
+            throw new GarSubscriptionXmlGetException('Could not get subscription XML', previous: $e);
         }
-
-        $xml = simplexml_load_string($response->getContent());
 
         foreach ($xml->children() as $child) {
             return $child;
@@ -383,10 +413,8 @@ class GarApiService
     }
 
     /**
-     * @throws TransportExceptionInterface
-     * @throws ServerExceptionInterface
-     * @throws RedirectionExceptionInterface
-     * @throws ClientExceptionInterface
+     * @throws GarSubscriptionXmlGetException
+     * @throws GarSubscriptionDatesUpdateException
      */
     public function updateSubscriptionDates(string $subscriptionId, GarCreatableSubscriptionInterface $subscription): bool
     {
@@ -415,11 +443,17 @@ class GarApiService
             'body' => $namespacedXml
         ]);
 
-        return $response->getStatusCode() === 200;
+        try {
+            $statusCode = $response->getStatusCode();
+        } catch (TransportExceptionInterface $e) {
+            throw new GarSubscriptionDatesUpdateException('Could not update subscription dates', previous: $e);
+        }
+
+        return $statusCode === 200;
     }
 
     /**
-     * @throws TransportExceptionInterface
+     * @throws GarSubscriptionDeleteException
      */
     public function deleteSubscription(string $subscriptionId): bool
     {
@@ -428,15 +462,21 @@ class GarApiService
             $this->getEndpoint("/" . $subscriptionId)
         );
 
-        return $response->getStatusCode() === 204;
+        try {
+            $statusCode = $response->getStatusCode();
+        } catch (TransportExceptionInterface $e) {
+            throw new GarSubscriptionDeleteException('Could not delete subscription', previous: $e);
+        }
+        return $statusCode === 204;
     }
 
     /**
      * @return GarReport[]
-     * @throws Exception
-     * @throws TransportExceptionInterface
+     * @throws GarCertificateConfigurationException
+     * @throws GarReportListGetException
      */
-    public function getReports(bool $notAcknowledged = true, bool $acknowledged = false): array {
+    public function getReports(bool $notAcknowledged = true, bool $acknowledged = false): array
+    {
         if (!$notAcknowledged && !$acknowledged) {
             return [];
         }
@@ -448,21 +488,27 @@ class GarApiService
         }
 
         $response = $this->getReportClient()->request('GET', $this->getReportEndpoint(sprintf("/rapportsAffectation/%s/%s", $this->distributorId, $status)));
-        $content = $response->getContent();
+        try {
+            $content = $response->getContent();
+        } catch (ClientExceptionInterface|RedirectionExceptionInterface|ServerExceptionInterface|TransportExceptionInterface $e) {
+            throw new GarReportListGetException('Could not get report list contents', previous: $e);
+        }
+
         $data = json_decode($content, true);
 
-        return array_map(function($data) {
+        return array_map(function ($data) {
             return (new GarReport())
                 ->setName($data['nomRapport'])
                 ->setTimestamp((DateTimeImmutable::createFromFormat('d/m/Y', $data['dateCreation']))->setTime(0, 0))
                 ->setSize($data['taille'])
                 ->setStatus($data['statut']);
-        }, array_filter($data['rapportsAffectation'], function($data) {
+        }, array_filter($data['rapportsAffectation'], function ($data) {
             return array_key_exists('statut', $data);
         }));
     }
 
-    private function getGlobalReportDirectory(): string {
+    private function getGlobalReportDirectory(): string
+    {
         $dir = $this->cacheDirectory . '/reports/global';
 
         if (!is_dir($dir)) {
@@ -472,18 +518,18 @@ class GarApiService
         return $dir;
     }
 
-    private function getTodayGlobalReportPath(): string {
+    private function getTodayGlobalReportPath(): string
+    {
         return $this->getGlobalReportDirectory() . '/' . date('Y-m-d') . '.xml';
     }
 
     /**
-     * @throws TransportExceptionInterface
-     * @throws ServerExceptionInterface
-     * @throws RedirectionExceptionInterface
-     * @throws ClientExceptionInterface
-     * @throws Exception
+     * @throws GarCertificateConfigurationException
+     * @throws GarGlobalReportDownloadException
+     * @throws GarReportDownloadException
      */
-    private function ensureLatestGlobalReport(): string {
+    private function ensureLatestGlobalReport(): string
+    {
         $todayPath = $this->getTodayGlobalReportPath();
 
         if (file_exists($todayPath)) {
@@ -498,7 +544,13 @@ class GarApiService
 
         // We don't care about the status filter because the global report is listed in all responses
         $response = $this->getReportClient()->request('GET', $this->getReportEndpoint(sprintf("/rapportsAffectation/%s/%s", $this->distributorId, GarReport::STATUS_ACKNOWLEDGED)));
-        $content = $response->getContent();
+
+        try {
+            $content = $response->getContent();
+        } catch (ClientExceptionInterface|RedirectionExceptionInterface|ServerExceptionInterface|TransportExceptionInterface $e) {
+            throw new GarGlobalReportDownloadException('Could not get global report contents', previous: $e);
+        }
+
         $data = json_decode($content, true);
 
         $reportData = $data['rapportsAffectation'][count($data['rapportsAffectation']) - 1];
@@ -515,13 +567,11 @@ class GarApiService
     }
 
     /**
-     * @throws TransportExceptionInterface
-     * @throws ServerExceptionInterface
-     * @throws RedirectionExceptionInterface
-     * @throws ClientExceptionInterface
-     * @throws Exception
+     * @throws GarCertificateConfigurationException
+     * @throws GarReportDownloadException
      */
-    private function downloadReport(string|GarReport $report): string {
+    private function downloadReport(string|GarReport $report): string
+    {
         $reportIdentifier = is_string($report) ? $report : $report->getName();
         $response = $this->getReportClient()->request('GET', $this->getReportEndpoint(sprintf("/GAR-Affectations/%s/%s", $this->distributorId, $reportIdentifier)));
         $directory = $this->cacheDirectory . '/reports';
@@ -531,7 +581,14 @@ class GarApiService
         }
 
         $zipPath = $directory . '/' . $reportIdentifier;
-        file_put_contents($zipPath, $response->getContent());
+
+        try {
+            $content = $response->getContent();
+        } catch (ClientExceptionInterface|RedirectionExceptionInterface|ServerExceptionInterface|TransportExceptionInterface $e) {
+            throw new GarReportDownloadException('Could not download report', previous: $e);
+        }
+
+        file_put_contents($zipPath, $content);
 
         $zip = new ZipArchive();
         $zip->open($zipPath);
@@ -545,6 +602,7 @@ class GarApiService
         $zip->close();
 
         unlink($zipPath);
+
         return $directory . '/' . $files[0];
     }
 
@@ -562,12 +620,12 @@ class GarApiService
      *     uai: string
      * }[]
      *
-     * @throws ClientExceptionInterface
-     * @throws RedirectionExceptionInterface
-     * @throws ServerExceptionInterface
-     * @throws TransportExceptionInterface
+     * @throws GarCertificateConfigurationException
+     * @throws GarGlobalReportDownloadException
+     * @throws GarReportDownloadException
      */
-    public function getGlobalReportItems(array $options = []): array {
+    public function getGlobalReportItems(array $options = []): array
+    {
         $xml = simplexml_load_file($this->ensureLatestGlobalReport());
 
         $resolver = new OptionsResolver();
@@ -592,11 +650,11 @@ class GarApiService
             $uaiList = is_string($uaiOption) ? [$uaiOption] : $uaiOption;
 
             if (count($uaiList) > 0) {
-                $selectors = array_map(function($uai) {
+                $selectors = array_map(function ($uai) {
                     return "@UAI='$uai'";
                 }, $uaiList);
 
-                $xpath .= "[".implode(' or ', $selectors)."]";
+                $xpath .= "[" . implode(' or ', $selectors) . "]";
             }
         }
 
@@ -607,15 +665,15 @@ class GarApiService
 
         foreach ($institutions as $institution) {
             $items[] = [
-                'resource' => [
-                    'id' => (string) $institution->xpath('../..')[0]['idRessource'],
-                    'title' => (string) $institution->xpath('../..')[0]['titreRessource'],
+                'resource'       => [
+                    'id'    => (string)$institution->xpath('../..')[0]['idRessource'],
+                    'title' => (string)$institution->xpath('../..')[0]['titreRessource'],
                 ],
-                'subscription' => [
-                    'id' => (string) $institution->xpath('..')[0]['idAbonnement'],
-                    'end' => (DateTimeImmutable::createFromFormat('Y-m-d', (string) $institution->xpath('..')[0]['finValidite']))->setTime(0, 0),
+                'subscription'   => [
+                    'id'  => (string)$institution->xpath('..')[0]['idAbonnement'],
+                    'end' => (DateTimeImmutable::createFromFormat('Y-m-d', (string)$institution->xpath('..')[0]['finValidite']))->setTime(0, 0),
                 ],
-                'uai' => (string) $institution['UAI'],
+                'uai'            => (string)$institution['UAI'],
                 'numAssignments' => count($institution->xpath('./Affectation')),
             ];
         }
